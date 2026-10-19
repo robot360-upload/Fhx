@@ -106,5 +106,10 @@ jobs:
           zip -r decompiled-pseudocode.zip analysis-output
           ls -lh decompiled-pseudocode.zip
       - name: Upload pseudocode ZIP
-        if: always() && hashFiles('decompiled-pseudocode.zip') != ''
+        if: always()
         uses: actions/upload-artifact@v4
+        with:
+          name: decompiled-pseudocode
+          path: decompiled-pseudocode.zip
+          if-no-files-found: error
+          retention-days: 14
