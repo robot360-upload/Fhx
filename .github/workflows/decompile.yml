@@ -1,0 +1,138 @@
+name: Decompile ELF
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Verify input executable
+        run: |
+          if [ ! -f executable ]; then
+            echo "::error::The executable file was not found in the repository root."
+            exit 1
+          fi
+          file executable
+      - name: Install Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+      - name: Download latest official Ghidra
+        shell: bash
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest"
+          echo "Fetching latest Ghidra release information..."
+          curl --fail --silent --show-error --location \
+            "$API" -o release.json
+          DOWNLOAD_URL="$(python3 -c '
+          import json
+          import sys
+          from urllib.parse import urlparse
+          with open("release.json", encoding="utf-8") as f:
+              release = json.load(f)
+          if release.get("draft") or release.get("prerelease"):
+              sys.exit("Latest release is not a stable published release.")
+          assets = release.get("assets", [])
+          matches = [
+              a["browser_download_url"]
+              for a in assets
+              if a["name"].endswith(".zip")
+              and a["name"].startswith("ghidra_")
+              and "PUBLIC" not in a["name"].upper()
+          ]
+          if len(matches) != 1:
+              sys.exit(
+                  "Expected exactly one official Ghidra release ZIP; "
+                  f"found {len(matches)}."
+              )
+          url = matches[0]
+          if urlparse(url).hostname != "github.com":
+              sys.exit("Unexpected Ghidra download host.")
+          print(url)
+          ')"
+          echo "Downloading: $DOWNLOAD_URL"
+          curl --fail --silent --show-error --location \
+            "$DOWNLOAD_URL" -o ghidra.zip
+          # Verify the downloaded archive against the SHA-256
+          # published in the official GitHub release metadata.
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlparse
+          with open("release.json", encoding="utf-8") as f:
+              release = json.load(f)
+          archive = Path("ghidra.zip")
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          assets = [
+              a for a in release["assets"]
+              if a["name"].endswith(".zip")
+              and a["name"].startswith("ghidra_")
+              and a["browser_download_url"]
+                  == os.environ.get("DOWNLOAD_URL", "")
+          ]
+          # Match the actual downloaded archive by its URL.
+          if not assets:
+              url = os.environ.get("GHIDRA_DOWNLOAD_URL", "")
+              assets = [
+                  a for a in release["assets"]
+                  if a["browser_download_url"] == url
+              ]
+          # GitHub release metadata may publish a digest.
+          expected = assets[0].get("digest") if assets else None
+          if expected:
+              expected = expected.removeprefix("sha256:")
+              if digest.lower() != expected.lower():
+                  sys.exit("SHA-256 verification failed!")
+              print("SHA-256 verified against release metadata.")
+          else:
+              print("No SHA-256 digest supplied for this asset.")
+              print("Archive SHA-256:", digest)
+          PY
+          mkdir ghidra-dist
+          unzip -q ghidra.zip -d ghidra-dist
+          GHIDRA_DIR="$(find ghidra-dist -mindepth 1 -maxdepth 1 \
+            -type d -name 'ghidra_*' | head -n 1)"
+          if [ -z "$GHIDRA_DIR" ] || \
+             [ ! -f "$GHIDRA_DIR/support/analyzeHeadless" ]; then
+            echo "::error::Invalid Ghidra distribution."
+            exit 1
+          fi
+          echo "GHIDRA_DIR=$GHIDRA_DIR" >> "$GITHUB_ENV"
+      - name: Prepare analysis directories
+        run: |
+          mkdir -p analysis-output project
+      - name: Run Ghidra headless analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$GHIDRA_DIR/support/analyzeHeadless" \
+            "$GITHUB_WORKSPACE/project" \
+            ExecutableAnalysis \
+            -import "$GITHUB_WORKSPACE/executable" \
+            -overwrite \
+            -analysisTimeoutPerFile 1800 \
+            -scriptPath "$GITHUB_WORKSPACE/scripts" \
+            -postScript ExportDecompiled.java \
+              "$GITHUB_WORKSPACE/analysis-output"
+      - name: Package pseudocode
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -d analysis-output ]; then
+            echo "::error::No analysis output directory was created."
+            exit 1
+          fi
+          zip -r decompiled-pseudocode.zip analysis-output
+          ls -lh decompiled-pseudocode.zip
+      - name: Upload pseudocode ZIP
+        if: always() && hashFiles('decompiled-pseudocode.zip') != ''
+        uses: actions/upload-artifact@v4
